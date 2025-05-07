@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Mi Sitio de Blogs y Noticias</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      padding: 0;
+      background-color: #f4f4f4;
+    }
+
+    header {
+      background-color: #333;
+      color: white;
+      padding: 1rem 2rem;
+      text-align: center;
+    }
+
+    nav {
+      background-color: #444;
+      padding: 1rem;
+      text-align: center;
+    }
+
+    nav a {
+      color: white;
+      margin: 0 15px;
+      text-decoration: none;
+    }
+
+    main {
+      padding: 2rem;
+    }
+
+    article {
+      background-color: white;
+      margin-bottom: 2rem;
+      padding: 1.5rem;
+      border-radius: 8px;
+      box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+    }
+
+    article h2 {
+      color: #333;
+    }
+
+    footer {
+      background-color: #222;
+      color: white;
+      text-align: center;
+      padding: 1rem;
+      margin-top: 2rem;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>Mi Blog de Reviews y Noticias</h1>
+</header>
+
+<nav>
+  <a href="#blog">Blog</a>
+  <a href="#reviews">Reviews</a>
+  <a href="#noticias">Noticias</a>
+</nav>
+
+<main>
+  <section id="blog">
+    <article>
+      <h2>Primer Blog</h2>
+      <p>Este es un artículo de blog donde compartirás tus ideas, pensamientos o experiencias.</p>
+    </article>
+  </section>
+
+  <section id="reviews">
+    <article>
+      <h2>Reseña de Producto X</h2>
+      <p>Aquí puedes escribir tu opinión detallada sobre productos, servicios, películas, libros, etc.</p>
+    </article>
+  </section>
+
+  <section id="noticias">
+    <article>
+      <h2>Últimas Noticias</h2>
+      <p>En esta sección puedes publicar noticias recientes de cualquier tema que te interese.</p>
+    </article>
+  </section>
+</main>
+
+<footer>
+  <p>&copy; 2025 - Mi Blog Personal. Todos los derechos reservados.</p>
+</footer>
+
+</body>
+</html>
