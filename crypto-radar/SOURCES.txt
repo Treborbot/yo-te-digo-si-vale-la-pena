@@ -1,0 +1,37 @@
+FUENTES Y DECISIONES DE DISEÑO
+
+1. Hyperliquid
+- Leaderboard público:
+  https://stats-data.hyperliquid.xyz/Mainnet/leaderboard
+- API de fills:
+  POST https://api.hyperliquid.xyz/info
+  type=userFillsByTime
+
+2. DexScreener
+- Token pairs y datos de liquidez/volumen:
+  https://api.dexscreener.com/tokens/v1/solana/{mint}
+- Últimos perfiles y boosts:
+  /token-profiles/latest/v1
+  /token-boosts/latest/v1
+  /token-boosts/top/v1
+
+3. Helius
+- Enhanced transaction history:
+  GET https://api-mainnet.helius-rpc.com/v0/addresses/{address}/transactions
+
+4. Pump.fun
+- Frontend endpoint para nuevos tokens:
+  https://frontend-api-v3.pump.fun/coins
+- Estos endpoints no son una API pública estable y pueden cambiar.
+
+5. FomoScan
+- Pump trader leaderboard:
+  https://api.fomoscan.sh/v2/pump/leaderboard/traders
+
+6. RugCheck
+- Resumen de riesgo:
+  https://api.rugcheck.xyz/v1/tokens/{mint}/report/summary
+
+ATRIBUCIONES DE WALLETS
+Las wallets de KOLs en config.json proceden de perfiles/tracking público on-chain.
+No se asume que una wallet represente la totalidad de las posiciones de una persona.

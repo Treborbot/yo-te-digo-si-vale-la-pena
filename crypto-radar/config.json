@@ -1,0 +1,65 @@
+{
+  "poll_seconds": 30,
+  "scanner_seconds": 120,
+  "leaderboard_seconds": 900,
+  "radar_score_threshold": 70,
+  "opportunity_alert_cooldown_seconds": 10800,
+  "kol_recent_buy_window_seconds": 3600,
+  "hyperliquid_window": "month",
+  "hyperliquid_top_n": 3,
+  "hyperliquid_min_account_value": 10000,
+  "hyperliquid_min_notional_usd": 0,
+  "pump_window": "7d",
+  "pump_top_n": 3,
+  "scanner": {
+    "pump_new_tokens": true,
+    "dex_latest": true,
+    "rugcheck": true,
+    "absolute_min_liquidity_usd": 8000,
+    "max_tokens_per_scan": 35
+  },
+  "wallets": [
+    {
+      "label": "Orangie (@orangie)",
+      "address": "DuQabFqdC9eeBULVa7TTdZYxe8vK8ct5DZr4Xcf7docy",
+      "enabled": true,
+      "source": "public-profile"
+    },
+    {
+      "label": "Rayan (@traderayann)",
+      "address": "BNahnx13rLru9zxuWNGBD7vVv1pGQXB11Q7qeTyupdWf",
+      "enabled": true,
+      "source": "tracked-kol"
+    },
+    {
+      "label": "Cupsey (@Cupseyy)",
+      "address": "2fg5QD1eD7rzNNCsvnhmXFm5hqNgwTTG8p7kQ6f3rx6f",
+      "enabled": true,
+      "source": "tracked-kol"
+    },
+    {
+      "label": "Dior (@Dior100x)",
+      "address": "87rRdssFiTJKY4MGARa4G5vQ31hmR7MxSmhzeaJ5AAxJ",
+      "enabled": true,
+      "source": "tracked-kol"
+    },
+    {
+      "label": "Cented (@Cented7)",
+      "address": "CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o",
+      "enabled": true,
+      "source": "tracked-kol"
+    },
+    {
+      "label": "Gake (@Ga__ke)",
+      "address": "DNfuF1L62WWyW3pNakVkyGGFzVVhj4Yr52jSmdTyeBHm",
+      "enabled": true,
+      "source": "tracked-kol"
+    },
+    {
+      "label": "West (@ratwizardx)",
+      "address": "JDd3hy3gQn2V982mi1zqhNqUw1GfV2UL6g76STojCJPN",
+      "enabled": true,
+      "source": "tracked-kol"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "people": [
+    {
+      "label": "Kimchi (@kimchi1x)",
+      "status": "NO ACTIVAR SIN VERIFICACIÓN ADICIONAL",
+      "candidate_address": "Hqs2PZXsJoP3oE2mmmQpWxc6psYxwJ5CxNFvGtRQ64ns",
+      "why_disabled": "Una moneda de Pump.fun enlaza @kimchi1x y muestra esta dirección como creador, pero el perfil de la dirección aparece como 'untoldwhale8567'. Eso no prueba de forma suficiente que sea la wallet principal de trading de Kimchi."
+    }
+  ]
+}
