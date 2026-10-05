@@ -131,6 +131,9 @@ def load_config() -> Dict[str, Any]:
     cfg.setdefault("radar_score_threshold", 70)
     cfg.setdefault("opportunity_alert_cooldown_seconds", 10800)
     cfg.setdefault("kol_recent_buy_window_seconds", 3600)
+    cfg.setdefault("kol_swarm_window_seconds", 900)
+    cfg.setdefault("kol_swarm_min_wallets", 2)
+    cfg.setdefault("kol_full_security_report", True)
     cfg.setdefault("hyperliquid_window", "month")
     cfg.setdefault("hyperliquid_top_n", 3)
     cfg.setdefault("hyperliquid_min_account_value", 10000)
@@ -155,6 +158,9 @@ def load_state() -> Dict[str, Any]:
     st.setdefault("candidate_tokens", {})
     st.setdefault("token_alerted_at", {})
     st.setdefault("kol_recent_buys", {})
+    st.setdefault("kol_trade_stats", {})
+    st.setdefault("kol_swarm_alerts", {})
+    st.setdefault("token_security_snapshots", {})
     st.setdefault("initialized_wallets", [])
     st.setdefault("initialized_hyper", [])
     return st
@@ -661,21 +667,243 @@ def wallet_token_flows(tx: Dict[str, Any], address: str) -> List[Tuple[str, floa
     return [(m, a) for m, a in flows.items() if abs(a) > 1e-15]
 
 
+SOL_MINT = "So11111111111111111111111111111111111111112"
+STABLE_MINTS = {
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
+    "Es9vMFrzaCERmJfrF4H2FYDkdxQivL6GxQYQy8H1KqG",   # USDT
+}
+PAYMENT_MINTS = STABLE_MINTS | {SOL_MINT}
+_PRICE_CACHE: Dict[str, Tuple[int, float]] = {}
+_RUG_FULL_CACHE: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+
+
 def choose_primary_flow(flows: List[Tuple[str, float]]) -> Optional[Tuple[str, float]]:
     if not flows:
         return None
-    # Ignora mints de stables conocidos cuando haya otro token.
-    stable_mints = {
-        "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-        "Es9vMFrzaCERmJfrF4H2FYDkdxQivL6GxQYQy8H1KqG",   # USDT historical
-    }
-    nonstable = [x for x in flows if x[0] not in stable_mints]
-    arr = nonstable or flows
-    # Token recibido suele ser el comprado; enviado suele ser el vendido.
+    nonpayment = [x for x in flows if x[0] not in PAYMENT_MINTS]
+    arr = nonpayment or flows
     positive = [x for x in arr if x[1] > 0]
     if positive:
         return max(positive, key=lambda x: abs(x[1]))
     return max(arr, key=lambda x: abs(x[1]))
+
+
+def _balance_change_ui(item: Dict[str, Any]) -> float:
+    raw = item.get("rawTokenAmount") or {}
+    amount = abs(num(raw.get("tokenAmount")))
+    decimals = int(num(raw.get("decimals"), 0))
+    if decimals < 0 or decimals > 30:
+        decimals = 0
+    return amount / (10 ** decimals)
+
+
+def _user_changes(items: Any, address: str) -> List[Dict[str, Any]]:
+    rows = [x for x in (items or []) if isinstance(x, dict)]
+    owned = [x for x in rows if str(x.get("userAccount") or "") == address]
+    return owned or rows
+
+
+def _largest_change(items: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not items:
+        return None
+    return max(items, key=_balance_change_ui)
+
+
+def parse_swap_trade(tx: Dict[str, Any], address: str) -> Optional[Dict[str, Any]]:
+    """Interpret a Helius SWAP using events.swap first, then transfer deltas as fallback."""
+    swap = ((tx.get("events") or {}).get("swap") or {})
+    if isinstance(swap, dict) and swap:
+        inputs = _user_changes(swap.get("tokenInputs"), address)
+        outputs = _user_changes(swap.get("tokenOutputs"), address)
+        nonpay_in = [x for x in inputs if str(x.get("mint") or "") not in PAYMENT_MINTS]
+        nonpay_out = [x for x in outputs if str(x.get("mint") or "") not in PAYMENT_MINTS]
+
+        native_in = swap.get("nativeInput") or {}
+        native_out = swap.get("nativeOutput") or {}
+        native_in_sol = 0.0
+        native_out_sol = 0.0
+        if isinstance(native_in, dict):
+            if not native_in.get("account") or str(native_in.get("account")) == address:
+                native_in_sol = abs(num(native_in.get("amount"))) / 1_000_000_000
+        if isinstance(native_out, dict):
+            if not native_out.get("account") or str(native_out.get("account")) == address:
+                native_out_sol = abs(num(native_out.get("amount"))) / 1_000_000_000
+
+        if nonpay_out:
+            target = _largest_change(nonpay_out)
+            side = "BUY"
+            payment_items = inputs
+            sol_amount = native_in_sol
+        elif nonpay_in:
+            target = _largest_change(nonpay_in)
+            side = "SELL"
+            payment_items = outputs
+            sol_amount = native_out_sol
+        else:
+            target = None
+            side = ""
+            payment_items = []
+            sol_amount = 0.0
+
+        if target:
+            mint = str(target.get("mint") or "")
+            token_amount = _balance_change_ui(target)
+            if not sol_amount:
+                sol_amount = sum(
+                    _balance_change_ui(x)
+                    for x in payment_items
+                    if str(x.get("mint") or "") == SOL_MINT
+                )
+            stable_usd = sum(
+                _balance_change_ui(x)
+                for x in payment_items
+                if str(x.get("mint") or "") in STABLE_MINTS
+            )
+            return {
+                "side": side,
+                "mint": mint,
+                "delta": token_amount if side == "BUY" else -token_amount,
+                "token_amount": token_amount,
+                "sol_amount": sol_amount,
+                "stable_usd": stable_usd,
+                "source": str(tx.get("source") or "SWAP"),
+                "parsed_from": "events.swap",
+            }
+
+    flows = wallet_token_flows(tx, address)
+    primary = choose_primary_flow(flows)
+    if not primary:
+        return None
+    mint, delta = primary
+    return {
+        "side": "BUY" if delta > 0 else "SELL",
+        "mint": mint,
+        "delta": delta,
+        "token_amount": abs(delta),
+        "sol_amount": 0.0,
+        "stable_usd": 0.0,
+        "source": str(tx.get("source") or "SWAP"),
+        "parsed_from": "tokenTransfers",
+    }
+
+
+def token_price_usd(mint: str, ttl: int = 30) -> float:
+    cached = _PRICE_CACHE.get(mint)
+    t = now_ts()
+    if cached and t - int(cached[0]) <= ttl:
+        return float(cached[1])
+    p = best_pair(mint)
+    price = num((p or {}).get("priceUsd"))
+    if price > 0:
+        _PRICE_CACHE[mint] = (t, price)
+    return price
+
+
+def estimate_trade_value_usd(info: Dict[str, Any], pair: Optional[Dict[str, Any]]) -> float:
+    stable = num(info.get("stable_usd"))
+    if stable > 0:
+        return stable
+
+    sol_amount = num(info.get("sol_amount"))
+    if sol_amount > 0:
+        sol_usd = token_price_usd(SOL_MINT)
+        if sol_usd > 0:
+            return sol_amount * sol_usd
+
+    token_amount = abs(num(info.get("token_amount")))
+    token_px = num((pair or {}).get("priceUsd"))
+    if token_amount > 0 and token_px > 0:
+        return token_amount * token_px
+    return 0.0
+
+
+def format_qty(v: float) -> str:
+    a = abs(v)
+    sign = "-" if v < 0 else "+"
+    if a >= 1_000_000_000:
+        return f"{sign}{a/1_000_000_000:.3f}B"
+    if a >= 1_000_000:
+        return f"{sign}{a/1_000_000:.3f}M"
+    if a >= 1_000:
+        return f"{sign}{a/1_000:.3f}K"
+    if a >= 1:
+        return f"{sign}{a:,.4f}".rstrip("0").rstrip(".")
+    return f"{sign}{a:.8g}"
+
+
+def age_text_at(pair: Optional[Dict[str, Any]], ts: int) -> str:
+    created_ms = int(num((pair or {}).get("pairCreatedAt")))
+    if not created_ms or not ts:
+        return "N/D"
+    seconds = max(0, ts - created_ms // 1000)
+    if seconds < 60:
+        return f"{seconds}s"
+    mins = seconds // 60
+    if mins < 60:
+        return f"{mins}m {seconds % 60:02d}s"
+    hours = mins // 60
+    return f"{hours}h {mins % 60:02d}m"
+
+
+def rug_report(mint: str, ttl: int = 60) -> Dict[str, Any]:
+    t = now_ts()
+    cached = _RUG_FULL_CACHE.get(mint)
+    if cached and t - int(cached[0]) <= ttl:
+        return cached[1]
+    try:
+        r = session.get(f"{RUG_BASE}/tokens/{mint}/report", timeout=15)
+        if not r.ok:
+            return {}
+        data = r.json()
+        if isinstance(data, dict):
+            _RUG_FULL_CACHE[mint] = (t, data)
+            return data
+    except Exception as exc:
+        print(f"[WARN] RugCheck full {mint[:8]}: {redact_error(exc)}")
+    return {}
+
+
+def security_snapshot(st: Dict[str, Any], mint: str, report: Dict[str, Any]) -> str:
+    if not report:
+        return "🛡 Seguridad: RugCheck sin datos"
+
+    holders = [x for x in (report.get("topHolders") or []) if isinstance(x, dict)]
+    top10 = sum(num(x.get("pct")) for x in holders[:10])
+    insider_pct = sum(num(x.get("pct")) for x in holders if x.get("insider"))
+
+    token = report.get("token") or {}
+    supply = num(token.get("supply"))
+    creator_balance = num(report.get("creatorBalance"))
+    creator_pct = (creator_balance / supply * 100.0) if supply > 0 else 0.0
+
+    mint_active = bool(token.get("mintAuthority"))
+    freeze_active = bool(token.get("freezeAuthority"))
+
+    movement = ""
+    snaps = st.setdefault("token_security_snapshots", {})
+    prev = snaps.get(mint) or {}
+    prev_balance = num(prev.get("creator_balance"))
+    if prev_balance > 0 and creator_balance >= 0 and creator_balance < prev_balance:
+        drop = (prev_balance - creator_balance) / prev_balance * 100.0
+        if drop >= 5:
+            movement = f" · ⚠️ saldo creador ↓{drop:.1f}%"
+    snaps[mint] = {
+        "creator": str(report.get("creator") or ""),
+        "creator_balance": creator_balance,
+        "top10_pct": top10,
+        "time": now_ts(),
+    }
+
+    authority = (
+        ("⚠️ mint activa" if mint_active else "mint revocada")
+        + " · "
+        + ("⚠️ freeze activa" if freeze_active else "freeze revocada")
+    )
+    insider = f" · insiders {insider_pct:.1f}%" if insider_pct > 0 else ""
+    return (
+        f"🛡 Top10 {top10:.1f}% · creador {creator_pct:.2f}% · "
+        f"{authority}{insider}{movement}"
+    )
 
 
 def add_recent_kol_buy(st: Dict[str, Any], mint: str, label: str, ts: int) -> None:
@@ -685,8 +913,12 @@ def add_recent_kol_buy(st: Dict[str, Any], mint: str, label: str, ts: int) -> No
     st["kol_recent_buys"][mint] = [x for x in arr if int(x.get("time", 0)) >= cutoff]
 
 
-def recent_kols_for_token(st: Dict[str, Any], cfg: Dict[str, Any], mint: str) -> List[str]:
-    cutoff = now_ts() - int(cfg.get("kol_recent_buy_window_seconds", 3600))
+def recent_kols_for_token(
+    st: Dict[str, Any], cfg: Dict[str, Any], mint: str,
+    window_seconds: Optional[int] = None,
+) -> List[str]:
+    window = int(window_seconds or cfg.get("kol_recent_buy_window_seconds", 3600))
+    cutoff = now_ts() - window
     return list(dict.fromkeys(
         x.get("label", "")
         for x in st.get("kol_recent_buys", {}).get(mint, [])
@@ -694,33 +926,167 @@ def recent_kols_for_token(st: Dict[str, Any], cfg: Dict[str, Any], mint: str) ->
     ))
 
 
-def kol_trade_alert(label: str, address: str, tx: Dict[str, Any],
-                    mint: str, delta: float, pair: Optional[Dict[str, Any]]) -> str:
-    side = "COMPRA / RECIBE" if delta > 0 else "VENTA / ENVÍA"
-    sig = tx.get("signature") or ""
+def update_kol_trade_stats(
+    st: Dict[str, Any], address: str, label: str, info: Dict[str, Any], ts: int
+) -> str:
+    mint = str(info.get("mint") or "")
+    amount = abs(num(info.get("token_amount")))
+    usd = max(0.0, num(info.get("usd_value")))
+    by_wallet = st.setdefault("kol_trade_stats", {}).setdefault(address, {})
+    s = by_wallet.setdefault(mint, {
+        "label": label,
+        "buys": 0,
+        "sells": 0,
+        "buy_tokens": 0.0,
+        "sell_tokens": 0.0,
+        "buy_usd": 0.0,
+        "sell_usd": 0.0,
+        "first_seen": ts,
+    })
+
+    if info.get("side") == "BUY":
+        s["buys"] = int(s.get("buys", 0)) + 1
+        s["buy_tokens"] = num(s.get("buy_tokens")) + amount
+        s["buy_usd"] = num(s.get("buy_usd")) + usd
+        note = "primera compra observada" if s["buys"] == 1 else f"recompra #{s['buys']}"
+    else:
+        s["sells"] = int(s.get("sells", 0)) + 1
+        s["sell_tokens"] = num(s.get("sell_tokens")) + amount
+        s["sell_usd"] = num(s.get("sell_usd")) + usd
+        bought = num(s.get("buy_tokens"))
+        sold = num(s.get("sell_tokens"))
+        if bought > 0:
+            pct = sold / bought * 100.0
+            if pct >= 95:
+                note = f"🚪 posible salida total ({pct:.0f}% de compras observadas vendido)"
+            else:
+                note = f"venta parcial ({pct:.0f}% de compras observadas vendido)"
+        else:
+            note = "venta observada sin compra previa en la memoria del bot"
+
+    s["last_seen"] = ts
+    net = num(s.get("buy_tokens")) - num(s.get("sell_tokens"))
+    s["net_tokens"] = net
+    return (
+        f"🎯 Seguimiento: {note} · compras {int(s.get('buys', 0))} · "
+        f"ventas {int(s.get('sells', 0))} · comprado observado {money(s.get('buy_usd'))}"
+    )
+
+
+def kol_trade_alert(
+    label: str,
+    address: str,
+    tx: Dict[str, Any],
+    info: Dict[str, Any],
+    pair: Optional[Dict[str, Any]],
+    tracking_note: str,
+    security_line: str,
+    recent_kols: List[str],
+) -> str:
+    side = str(info.get("side") or "SWAP")
+    side_text = "🟢 COMPRA" if side == "BUY" else "🔴 VENTA"
+    sig = str(tx.get("signature") or "")
     timestamp = int(tx.get("timestamp") or 0)
-    extra = ""
+    mint = str(info.get("mint") or "")
+    delta = num(info.get("delta"))
+    usd = num(info.get("usd_value"))
+    sol_amount = num(info.get("sol_amount"))
+
+    name = "Token"
+    sym = "?"
+    liq = mcap = vol1 = price = 0.0
+    buys = sells = 0
     if pair:
         name = ((pair.get("baseToken") or {}).get("name") or "Token")
         sym = ((pair.get("baseToken") or {}).get("symbol") or "?")
         liq = num((pair.get("liquidity") or {}).get("usd"))
-        mc = num(pair.get("marketCap") or pair.get("fdv"))
-        extra = (
-            f"\n🪙 {html.escape(str(name))} ({html.escape(str(sym))})"
-            f"\n💧 Liquidez: {money(liq)}"
-            f"\n💰 MC/FDV: {money(mc)}"
-        )
+        mcap = num(pair.get("marketCap") or pair.get("fdv"))
+        vol1 = num((pair.get("volume") or {}).get("h1"))
+        price = num(pair.get("priceUsd"))
+        txh = (pair.get("txns") or {}).get("h1") or {}
+        buys = int(num(txh.get("buys")))
+        sells = int(num(txh.get("sells")))
+
+    ratio = (buys / sells) if sells > 0 else (float(buys) if buys else 0.0)
+    if sol_amount > 0 and usd > 0:
+        size_line = f"💳 Tamaño: <b>{sol_amount:.4f} SOL ≈ {money(usd)}</b>"
+    elif usd > 0:
+        size_line = f"💳 Valor aprox.: <b>{money(usd)}</b>"
+    else:
+        size_line = "💳 Valor aprox.: <b>N/D</b>"
+
+    kols_text = ", ".join(recent_kols) if recent_kols else "solo esta wallet"
+    protocol = html.escape(str(info.get("source") or "SWAP"))
 
     return (
-        f"👀 <b>KOL WALLET — {html.escape(side)}</b>\n\n"
+        f"👀 <b>KOL WALLET — {side_text}</b>\n\n"
         f"👤 <b>{html.escape(label)}</b>\n"
         f"👛 <code>{html.escape(address)}</code>\n"
         f"🕒 {html.escape(utc_text(timestamp))}\n"
+        f"⚙️ Protocolo: {protocol}\n\n"
+        f"🪙 <b>{html.escape(str(name))} ({html.escape(str(sym))})</b>\n"
         f"📄 CA / Mint:\n<code>{html.escape(mint)}</code>\n"
-        f"🔢 Cambio de tokens: {delta:+.8g}"
-        f"{extra}\n\n"
+        f"🔢 Tokens: <b>{html.escape(format_qty(delta))}</b>\n"
+        f"{size_line}\n"
+        f"💵 Precio al detectar: {money(price) if price > 0 else 'N/D'}\n"
+        f"💰 MC al detectar: <b>{money(mcap)}</b>\n"
+        f"💧 Liquidez: <b>{money(liq)}</b>\n"
+        f"⏳ Edad al ejecutar: <b>{html.escape(age_text_at(pair, timestamp))}</b>\n"
+        f"📊 Volumen 1h: {money(vol1)}\n"
+        f"🔄 1h: {buys} compras / {sells} ventas · ratio {ratio:.2f}\n"
+        f"👥 KOLs recientes: {html.escape(kols_text)}\n"
+        f"{html.escape(tracking_note)}\n"
+        f"{html.escape(security_line)}\n\n"
         f"🔎 https://solscan.io/tx/{html.escape(sig)}\n"
         f"📊 https://dexscreener.com/solana/{html.escape(mint)}"
+    )
+
+
+def kol_swarm_alert(
+    cfg: Dict[str, Any],
+    st: Dict[str, Any],
+    mint: str,
+    pair: Optional[Dict[str, Any]],
+    report: Dict[str, Any],
+) -> Optional[str]:
+    window = int(cfg.get("kol_swarm_window_seconds", 900))
+    minimum = int(cfg.get("kol_swarm_min_wallets", 2))
+    kols = recent_kols_for_token(st, cfg, mint, window)
+    level = len(kols)
+    if level < minimum:
+        return None
+
+    rec = st.setdefault("kol_swarm_alerts", {}).get(mint) or {}
+    previous = int(rec.get("level", 0))
+    last = int(rec.get("time", 0))
+    if now_ts() - last > window:
+        previous = 0
+    if level <= previous:
+        return None
+
+    st["kol_swarm_alerts"][mint] = {"level": level, "time": now_ts()}
+    p = pair or {}
+    name = ((p.get("baseToken") or {}).get("name") or "Token")
+    sym = ((p.get("baseToken") or {}).get("symbol") or "?")
+    liq = num((p.get("liquidity") or {}).get("usd"))
+    mcap = num(p.get("marketCap") or p.get("fdv"))
+    txh = (p.get("txns") or {}).get("h1") or {}
+    buys = int(num(txh.get("buys")))
+    sells = int(num(txh.get("sells")))
+    ratio = (buys / sells) if sells > 0 else (float(buys) if buys else 0.0)
+    score = token_score(mint, p, report or {}, kols).score if p else 0
+
+    return (
+        f"🚨 <b>KOL SWARM — {level} WALLETS</b>\n\n"
+        f"🪙 <b>{html.escape(str(name))} ({html.escape(str(sym))})</b>\n"
+        f"📄 <code>{html.escape(mint)}</code>\n"
+        f"👥 {html.escape(', '.join(kols))}\n\n"
+        f"💰 MC al detectar: <b>{money(mcap)}</b>\n"
+        f"💧 Liquidez: <b>{money(liq)}</b>\n"
+        f"🔄 1h: {buys} compras / {sells} ventas · ratio {ratio:.2f}\n"
+        f"🧠 Radar Score: <b>{score}/100</b>\n\n"
+        f"📊 https://dexscreener.com/solana/{html.escape(mint)}\n\n"
+        "⚠️ Convergencia de wallets = señal de interés, no garantía de subida."
     )
 
 
@@ -758,17 +1124,39 @@ def check_wallets(cfg: Dict[str, Any], st: Dict[str, Any]) -> None:
                 fresh.append(tx)
 
             for tx in reversed(fresh):
-                flows = wallet_token_flows(tx, address)
-                primary = choose_primary_flow(flows)
-                if not primary:
+                info = parse_swap_trade(tx, address)
+                if not info:
                     continue
-                mint, delta = primary
+
+                mint = str(info.get("mint") or "")
+                if not mint or mint in PAYMENT_MINTS:
+                    continue
+
                 pair = best_pair(mint)
+                info["usd_value"] = estimate_trade_value_usd(info, pair)
+                ts = int(tx.get("timestamp") or now_ts())
 
-                if delta > 0:
-                    add_recent_kol_buy(st, mint, label, int(tx.get("timestamp") or now_ts()))
+                report = rug_report(mint) if cfg.get("kol_full_security_report", True) else {}
+                security_line = security_snapshot(st, mint, report)
+                tracking_note = update_kol_trade_stats(st, address, label, info, ts)
 
-                broadcast(st, kol_trade_alert(label, address, tx, mint, delta, pair))
+                if info.get("side") == "BUY":
+                    add_recent_kol_buy(st, mint, label, ts)
+
+                swarm_window = int(cfg.get("kol_swarm_window_seconds", 900))
+                recent = recent_kols_for_token(st, cfg, mint, swarm_window)
+                broadcast(
+                    st,
+                    kol_trade_alert(
+                        label, address, tx, info, pair,
+                        tracking_note, security_line, recent,
+                    ),
+                )
+
+                if info.get("side") == "BUY":
+                    swarm = kol_swarm_alert(cfg, st, mint, pair, report)
+                    if swarm:
+                        broadcast(st, swarm)
 
             st["wallet_last_sig"][address] = newest_sig
 
