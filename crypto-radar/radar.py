@@ -41,6 +41,8 @@ PUMP_JWT = os.getenv("PUMP_JWT", "").strip()
 TG_API = f"https://api.telegram.org/bot{TG_TOKEN}" if TG_TOKEN else ""
 TELEGRAM_POLL_READY = False
 HELIUS_READY = False
+HELIUS_UNFILTERED_ADDRESSES: set[str] = set()
+HELIUS_FALLBACK_LOGGED: set[str] = set()
 
 session = requests.Session()
 session.headers.update({
@@ -630,22 +632,65 @@ def effective_wallets(cfg: Dict[str, Any], st: Dict[str, Any]) -> List[Dict[str,
     return result
 
 
+def _is_swap_tx(tx: Dict[str, Any]) -> bool:
+    if str(tx.get("type") or "").upper() == "SWAP":
+        return True
+    swap = ((tx.get("events") or {}).get("swap") or {})
+    return isinstance(swap, dict) and bool(swap)
+
+
 def helius_history(address: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    Enhanced Transactions API.
+
+    Helius' current documented host is api.helius.xyz. Some high-activity
+    addresses intermittently return 404 when the server-side type=SWAP filter
+    is used. In that case we remember the address for this process, fetch a
+    wider unfiltered window, and identify swaps locally.
+    """
     global HELIUS_READY
     if not HELIUS_API_KEY:
         return []
-    url = f"https://api-mainnet.helius-rpc.com/v0/addresses/{address}/transactions"
-    params = {
+
+    url = f"https://api.helius.xyz/v0/addresses/{address}/transactions"
+    use_unfiltered = address in HELIUS_UNFILTERED_ADDRESSES
+    fetch_limit = max(60, min(100, int(limit) * 4)) if use_unfiltered else int(limit)
+
+    params: Dict[str, Any] = {
         "api-key": HELIUS_API_KEY,
-        "limit": limit,
-        "type": "SWAP",
-        "commitment": "confirmed",
+        "limit": fetch_limit,
     }
+    if not use_unfiltered:
+        params["type"] = "SWAP"
+
     r = session.get(url, params=params, timeout=25)
+
+    # A few active wallets can return 404 only with the server-side SWAP
+    # filter. Retry once without it, then keep using the fallback in memory.
+    if r.status_code == 404 and not use_unfiltered:
+        HELIUS_UNFILTERED_ADDRESSES.add(address)
+        if address not in HELIUS_FALLBACK_LOGGED:
+            print(
+                f"[INFO] Helius: filtro SWAP no disponible para {address[:8]}…; "
+                "usando historial general + filtro local."
+            )
+            HELIUS_FALLBACK_LOGGED.add(address)
+
+        params = {
+            "api-key": HELIUS_API_KEY,
+            "limit": max(60, min(100, int(limit) * 4)),
+        }
+        r = session.get(url, params=params, timeout=25)
+        use_unfiltered = True
+
     r.raise_for_status()
     data = r.json()
     if not isinstance(data, list):
         raise RuntimeError("Helius devolvió una respuesta inesperada.")
+
+    if use_unfiltered:
+        data = [tx for tx in data if isinstance(tx, dict) and _is_swap_tx(tx)][:limit]
+
     if not HELIUS_READY:
         print("[OK] Helius conectado: consulta de transacciones correcta.")
         HELIUS_READY = True
