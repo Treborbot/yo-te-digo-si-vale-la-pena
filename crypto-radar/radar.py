@@ -604,9 +604,10 @@ def signal_alert(sig: TokenSignal) -> str:
         f"🛡 RugCheck: {html.escape(rug_note)}\n"
         f"👀 KOLs: {html.escape(', '.join(sig.kol_labels) or 'ninguno')}\n\n"
         f"🧠 Señales: {html.escape(reasons)}\n\n"
-        f"🔎 DexScreener: https://dexscreener.com/solana/{html.escape(sig.mint)}\n"
-        f"🟢 Pump: https://pump.fun/coin/{html.escape(sig.mint)}\n\n"
-        "⚠️ El puntaje mide señales observables; no predice que el token vaya a subir."
+        f"{trade_action_links_html(sig.mint, 'BUY', p)}\n"
+        f"🔎 DexScreener: https://dexscreener.com/solana/{html.escape(sig.mint)}\n\n"
+        "⚠️ El enlace abre el exchange con el token cargado; la operación siempre se confirma manualmente. "
+        "El puntaje mide señales observables y no predice que el token vaya a subir."
     )
 
 
@@ -675,6 +676,33 @@ STABLE_MINTS = {
 PAYMENT_MINTS = STABLE_MINTS | {SOL_MINT}
 _PRICE_CACHE: Dict[str, Tuple[int, float]] = {}
 _RUG_FULL_CACHE: Dict[str, Tuple[int, Dict[str, Any]]] = {}
+
+
+def trade_action_links_html(
+    mint: str,
+    side: str = "BUY",
+    pair: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Manual trading links only; the bot never signs or submits an order."""
+    safe_mint = quote(str(mint), safe="")
+    safe_sol = quote(SOL_MINT, safe="")
+    is_sell = str(side).upper() == "SELL"
+
+    if is_sell:
+        action = "💸 <b>Vender:</b>"
+        jupiter = f"https://jup.ag/swap?buy={safe_sol}&sell={safe_mint}"
+    else:
+        action = "🛒 <b>Comprar:</b>"
+        jupiter = f"https://jup.ag/swap?buy={safe_mint}&sell={safe_sol}"
+
+    pump = f"https://pump.fun/coin/{safe_mint}"
+    dex_name = html.escape(str((pair or {}).get("dexId") or "Solana"))
+
+    return (
+        f'{action} <a href="{jupiter}">Jupiter</a>'
+        f' · <a href="{pump}">Pump.fun</a>'
+        f' · DEX: <b>{dex_name}</b>'
+    )
 
 
 def choose_primary_flow(flows: List[Tuple[str, float]]) -> Optional[Tuple[str, float]]:
@@ -1037,6 +1065,7 @@ def kol_trade_alert(
         f"👥 KOLs recientes: {html.escape(kols_text)}\n"
         f"{html.escape(tracking_note)}\n"
         f"{html.escape(security_line)}\n\n"
+        f"{trade_action_links_html(mint, side, pair)}\n"
         f"🔎 https://solscan.io/tx/{html.escape(sig)}\n"
         f"📊 https://dexscreener.com/solana/{html.escape(mint)}"
     )
@@ -1085,6 +1114,7 @@ def kol_swarm_alert(
         f"💧 Liquidez: <b>{money(liq)}</b>\n"
         f"🔄 1h: {buys} compras / {sells} ventas · ratio {ratio:.2f}\n"
         f"🧠 Radar Score: <b>{score}/100</b>\n\n"
+        f"{trade_action_links_html(mint, 'BUY', p)}\n"
         f"📊 https://dexscreener.com/solana/{html.escape(mint)}\n\n"
         "⚠️ Convergencia de wallets = señal de interés, no garantía de subida."
     )
