@@ -135,6 +135,7 @@ def load_config() -> Dict[str, Any]:
     cfg.setdefault("kol_recent_buy_window_seconds", 3600)
     cfg.setdefault("kol_swarm_window_seconds", 900)
     cfg.setdefault("kol_swarm_min_wallets", 2)
+    cfg.setdefault("kol_high_convergence_min_wallets", 3)
     cfg.setdefault("kol_full_security_report", True)
     cfg.setdefault("hyperliquid_window", "month")
     cfg.setdefault("hyperliquid_top_n", 3)
@@ -953,17 +954,27 @@ def security_snapshot(st: Dict[str, Any], mint: str, report: Dict[str, Any]) -> 
     freeze_active = bool(token.get("freezeAuthority"))
 
     movement = ""
+    creator_drop_pct = 0.0
+    movement_detected = False
     snaps = st.setdefault("token_security_snapshots", {})
     prev = snaps.get(mint) or {}
     prev_balance = num(prev.get("creator_balance"))
     if prev_balance > 0 and creator_balance >= 0 and creator_balance < prev_balance:
-        drop = (prev_balance - creator_balance) / prev_balance * 100.0
-        if drop >= 5:
-            movement = f" · ⚠️ saldo creador ↓{drop:.1f}%"
+        creator_drop_pct = (prev_balance - creator_balance) / prev_balance * 100.0
+        if creator_drop_pct >= 5:
+            movement_detected = True
+            movement = f" · ⚠️ saldo creador ↓{creator_drop_pct:.1f}%"
+
     snaps[mint] = {
         "creator": str(report.get("creator") or ""),
         "creator_balance": creator_balance,
+        "creator_pct": creator_pct,
+        "creator_drop_pct": creator_drop_pct,
+        "creator_movement_detected": movement_detected,
         "top10_pct": top10,
+        "insider_pct": insider_pct,
+        "mint_active": mint_active,
+        "freeze_active": freeze_active,
         "time": now_ts(),
     }
 
@@ -979,24 +990,235 @@ def security_snapshot(st: Dict[str, Any], mint: str, report: Dict[str, Any]) -> 
     )
 
 
-def add_recent_kol_buy(st: Dict[str, Any], mint: str, label: str, ts: int) -> None:
+def short_kol_label(label: str) -> str:
+    text = str(label or "KOL").strip()
+    if " (" in text:
+        text = text.split(" (", 1)[0]
+    return text[:28]
+
+
+def elapsed_short(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, sec = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {sec:02d}s"
+    hours, minute = divmod(minutes, 60)
+    return f"{hours}h {minute:02d}m"
+
+
+def add_recent_kol_buy(
+    st: Dict[str, Any],
+    mint: str,
+    label: str,
+    address: str,
+    ts: int,
+    detected_at: int,
+    usd_value: float,
+    mcap: float,
+    price: float,
+    token_amount: float,
+) -> None:
     arr = st.setdefault("kol_recent_buys", {}).setdefault(mint, [])
-    arr.append({"label": label, "time": ts})
+    arr.append({
+        "label": label,
+        "address": address,
+        "time": int(ts),
+        "detected_at": int(detected_at),
+        "latency_seconds": max(0, int(detected_at) - int(ts)),
+        "usd_value": max(0.0, num(usd_value)),
+        "mcap": max(0.0, num(mcap)),
+        "price": max(0.0, num(price)),
+        "token_amount": max(0.0, num(token_amount)),
+    })
     cutoff = now_ts() - 6 * 3600
-    st["kol_recent_buys"][mint] = [x for x in arr if int(x.get("time", 0)) >= cutoff]
+    st["kol_recent_buys"][mint] = [
+        x for x in arr if int(x.get("time", 0)) >= cutoff
+    ]
+
+
+def recent_kol_buy_entries(
+    st: Dict[str, Any],
+    cfg: Dict[str, Any],
+    mint: str,
+    window_seconds: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    window = int(window_seconds or cfg.get("kol_recent_buy_window_seconds", 3600))
+    cutoff = now_ts() - window
+    return sorted(
+        [
+            x for x in st.get("kol_recent_buys", {}).get(mint, [])
+            if int(x.get("time", 0)) >= cutoff and x.get("label")
+        ],
+        key=lambda x: int(x.get("time", 0)),
+    )
 
 
 def recent_kols_for_token(
     st: Dict[str, Any], cfg: Dict[str, Any], mint: str,
     window_seconds: Optional[int] = None,
 ) -> List[str]:
-    window = int(window_seconds or cfg.get("kol_recent_buy_window_seconds", 3600))
-    cutoff = now_ts() - window
     return list(dict.fromkeys(
         x.get("label", "")
-        for x in st.get("kol_recent_buys", {}).get(mint, [])
-        if int(x.get("time", 0)) >= cutoff and x.get("label")
+        for x in recent_kol_buy_entries(st, cfg, mint, window_seconds)
+        if x.get("label")
     ))
+
+
+def kol_conviction_score(
+    st: Dict[str, Any],
+    entries: List[Dict[str, Any]],
+    liquidity_usd: float,
+) -> int:
+    if not entries:
+        return 0
+
+    unique = list(dict.fromkeys(str(x.get("label") or "") for x in entries))
+    level = len(unique)
+    score = 0.0
+
+    if level >= 5:
+        score += 65
+    elif level == 4:
+        score += 58
+    elif level == 3:
+        score += 50
+    elif level == 2:
+        score += 35
+    else:
+        score += 15
+
+    total_usd = sum(max(0.0, num(x.get("usd_value"))) for x in entries)
+    if total_usd >= 10_000:
+        score += 20
+    elif total_usd >= 3_000:
+        score += 16
+    elif total_usd >= 1_000:
+        score += 12
+    elif total_usd >= 300:
+        score += 8
+    elif total_usd >= 50:
+        score += 4
+
+    times = [int(x.get("time", 0)) for x in entries if int(x.get("time", 0)) > 0]
+    if len(times) >= 2:
+        spread = max(times) - min(times)
+        if spread <= 60:
+            score += 15
+        elif spread <= 180:
+            score += 12
+        elif spread <= 300:
+            score += 8
+        elif spread <= 900:
+            score += 4
+
+    if liquidity_usd > 0 and total_usd > 0:
+        impact = total_usd / liquidity_usd
+        if impact >= 0.10:
+            score += 10
+        elif impact >= 0.05:
+            score += 7
+        elif impact >= 0.01:
+            score += 3
+
+    per_label: Dict[str, int] = {}
+    for x in entries:
+        key = str(x.get("label") or "")
+        per_label[key] = per_label.get(key, 0) + 1
+    repeat_buys = sum(max(0, c - 1) for c in per_label.values())
+    score += min(10, repeat_buys * 4)
+
+    return int(clamp(round(score), 0, 100))
+
+
+def convergence_risk(
+    st: Dict[str, Any],
+    mint: str,
+    pair: Dict[str, Any],
+    report: Dict[str, Any],
+) -> Tuple[str, float, float, str]:
+    liq = num((pair.get("liquidity") or {}).get("usd"))
+    snap = st.get("token_security_snapshots", {}).get(mint) or {}
+
+    holders = [x for x in (report.get("topHolders") or []) if isinstance(x, dict)]
+    top10 = num(snap.get("top10_pct"))
+    if top10 <= 0 and holders:
+        top10 = sum(num(x.get("pct")) for x in holders[:10])
+
+    token = report.get("token") or {}
+    supply = num(token.get("supply"))
+    creator_balance = num(report.get("creatorBalance"))
+    creator_pct = num(snap.get("creator_pct"))
+    if creator_pct <= 0 and supply > 0:
+        creator_pct = creator_balance / supply * 100.0
+
+    insider_pct = num(snap.get("insider_pct"))
+    if insider_pct <= 0:
+        insider_pct = sum(num(x.get("pct")) for x in holders if x.get("insider"))
+
+    mint_active = bool(snap.get("mint_active", token.get("mintAuthority")))
+    freeze_active = bool(snap.get("freeze_active", token.get("freezeAuthority")))
+    dev_movement = bool(snap.get("creator_movement_detected"))
+    dev_drop = num(snap.get("creator_drop_pct"))
+
+    risk = 0.0
+    if liq < 8_000:
+        risk += 35
+    elif liq < 20_000:
+        risk += 25
+    elif liq < 50_000:
+        risk += 15
+    elif liq < 100_000:
+        risk += 7
+
+    if top10 >= 50:
+        risk += 30
+    elif top10 >= 30:
+        risk += 20
+    elif top10 >= 20:
+        risk += 10
+
+    if creator_pct >= 10:
+        risk += 25
+    elif creator_pct >= 5:
+        risk += 15
+    elif creator_pct >= 2:
+        risk += 7
+
+    if insider_pct >= 20:
+        risk += 15
+    elif insider_pct >= 10:
+        risk += 8
+
+    if mint_active:
+        risk += 18
+    if freeze_active:
+        risk += 18
+    if dev_movement:
+        risk += 20
+
+    rug_penalty, _ = extract_rug_penalty(report or {})
+    risk += rug_penalty * 0.5
+    risk = clamp(risk, 0, 100)
+
+    if risk < 20:
+        label = "BAJO"
+    elif risk < 40:
+        label = "MEDIO"
+    elif risk < 60:
+        label = "MEDIO-ALTO"
+    else:
+        label = "ALTO"
+
+    if dev_movement:
+        dev_text = f"⚠️ saldo creador cayó {dev_drop:.1f}% desde la última observación"
+    elif snap:
+        dev_text = "sin ventas/movimientos detectados desde que el radar observa"
+    else:
+        dev_text = "sin historial suficiente"
+
+    return label, top10, creator_pct, dev_text
 
 
 def update_kol_trade_stats(
@@ -1125,7 +1347,11 @@ def kol_swarm_alert(
 ) -> Optional[str]:
     window = int(cfg.get("kol_swarm_window_seconds", 900))
     minimum = int(cfg.get("kol_swarm_min_wallets", 2))
-    kols = recent_kols_for_token(st, cfg, mint, window)
+    high_minimum = int(cfg.get("kol_high_convergence_min_wallets", 3))
+    entries = recent_kol_buy_entries(st, cfg, mint, window)
+    kols = list(dict.fromkeys(
+        str(x.get("label") or "") for x in entries if x.get("label")
+    ))
     level = len(kols)
     if level < minimum:
         return None
@@ -1138,30 +1364,78 @@ def kol_swarm_alert(
     if level <= previous:
         return None
 
-    st["kol_swarm_alerts"][mint] = {"level": level, "time": now_ts()}
     p = pair or {}
     name = ((p.get("baseToken") or {}).get("name") or "Token")
     sym = ((p.get("baseToken") or {}).get("symbol") or "?")
     liq = num((p.get("liquidity") or {}).get("usd"))
-    mcap = num(p.get("marketCap") or p.get("fdv"))
+    current_mcap = num(p.get("marketCap") or p.get("fdv"))
     txh = (p.get("txns") or {}).get("h1") or {}
     buys = int(num(txh.get("buys")))
     sells = int(num(txh.get("sells")))
     ratio = (buys / sells) if sells > 0 else (float(buys) if buys else 0.0)
-    score = token_score(mint, p, report or {}, kols).score if p else 0
+
+    token_radar = token_score(mint, p, report or {}, kols).score if p else 0
+    conviction = kol_conviction_score(st, entries, liq)
+    overall = int(clamp(round(conviction * 0.60 + token_radar * 0.40 + (5 if level >= 3 else 0)), 0, 100))
+
+    total_usd = sum(max(0.0, num(x.get("usd_value"))) for x in entries)
+    first = entries[0] if entries else {}
+    newest = entries[-1] if entries else {}
+    first_ts = int(first.get("time", 0))
+    first_mcap = num(first.get("mcap"))
+    latest_latency = int(num(newest.get("latency_seconds")))
+
+    mcap_change = None
+    if first_mcap > 0 and current_mcap > 0:
+        mcap_change = (current_mcap / first_mcap - 1.0) * 100.0
+
+    risk_label, top10, creator_pct, dev_text = convergence_risk(
+        st, mint, p, report or {}
+    )
+
+    st["kol_swarm_alerts"][mint] = {
+        "level": level,
+        "time": now_ts(),
+        "overall": overall,
+        "conviction": conviction,
+        "token_radar": token_radar,
+        "risk": risk_label,
+    }
+
+    names = " + ".join(short_kol_label(x) for x in kols)
+    first_ago = elapsed_short(now_ts() - first_ts) if first_ts else "N/D"
+    first_mc_text = money(first_mcap) if first_mcap > 0 else "N/D"
+    current_mc_text = money(current_mcap) if current_mcap > 0 else "N/D"
+    if mcap_change is not None:
+        current_mc_text += f" ({mcap_change:+.0f}%)"
+
+    if level >= high_minimum:
+        title = f"🔥 <b>ALTA CONVERGENCIA — {overall}/100</b>"
+    else:
+        title = f"🟠 <b>CONVERGENCIA — {overall}/100</b>"
+
+    total_text = money(total_usd) if total_usd > 0 else "N/D"
+    top10_text = f"{top10:.1f}%" if top10 > 0 else "N/D"
 
     return (
-        f"🚨 <b>KOL SWARM — {level} WALLETS</b>\n\n"
-        f"🪙 <b>{html.escape(str(name))} ({html.escape(str(sym))})</b>\n"
-        f"📄 <code>{html.escape(mint)}</code>\n"
-        f"👥 {html.escape(', '.join(kols))}\n\n"
-        f"💰 MC al detectar: <b>{money(mcap)}</b>\n"
+        f"{title}\n"
+        f"{html.escape(names)}\n\n"
+        f"💰 Comprado por KOLs: <b>≈ {total_text}</b>\n"
+        f"🕐 Primer KOL: hace <b>{html.escape(first_ago)}</b>\n"
+        f"⚡ Retraso del radar: <b>{latest_latency}s</b>\n"
+        f"📈 MC primera entrada: <b>{first_mc_text}</b>\n"
+        f"📈 MC actual: <b>{current_mc_text}</b>\n"
         f"💧 Liquidez: <b>{money(liq)}</b>\n"
-        f"🔄 1h: {buys} compras / {sells} ventas · ratio {ratio:.2f}\n"
-        f"🧠 Radar Score: <b>{score}/100</b>\n\n"
+        f"🔄 Buy/Sell: <b>{ratio:.2f}</b> ({buys}/{sells})\n"
+        f"👥 Top 10: <b>{top10_text}</b>\n"
+        f"👨‍💻 Dev: {html.escape(dev_text)}\n\n"
+        f"🎯 <b>Convicción KOL: {conviction}/100</b>\n"
+        f"🧠 <b>Token Radar: {token_radar}/100</b>\n"
+        f"⚠️ <b>Riesgo: {html.escape(risk_label)}</b>\n\n"
         f"{trade_action_links_html(mint, 'BUY', p)}\n"
+        f"📋 Contrato: <code>{html.escape(mint)}</code>\n"
         f"📊 https://dexscreener.com/solana/{html.escape(mint)}\n\n"
-        "⚠️ Convergencia de wallets = señal de interés, no garantía de subida."
+        "⚠️ Convicción y Radar Score son filtros observacionales, no una garantía de rentabilidad."
     )
 
 
@@ -1216,7 +1490,20 @@ def check_wallets(cfg: Dict[str, Any], st: Dict[str, Any]) -> None:
                 tracking_note = update_kol_trade_stats(st, address, label, info, ts)
 
                 if info.get("side") == "BUY":
-                    add_recent_kol_buy(st, mint, label, ts)
+                    pair_mcap = num((pair or {}).get("marketCap") or (pair or {}).get("fdv"))
+                    pair_price = num((pair or {}).get("priceUsd"))
+                    add_recent_kol_buy(
+                        st=st,
+                        mint=mint,
+                        label=label,
+                        address=address,
+                        ts=ts,
+                        detected_at=now_ts(),
+                        usd_value=num(info.get("usd_value")),
+                        mcap=pair_mcap,
+                        price=pair_price,
+                        token_amount=num(info.get("token_amount")),
+                    )
 
                 swarm_window = int(cfg.get("kol_swarm_window_seconds", 900))
                 recent = recent_kols_for_token(st, cfg, mint, swarm_window)
