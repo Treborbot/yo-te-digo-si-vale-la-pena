@@ -61,5 +61,8 @@
       "enabled": true,
       "source": "tracked-kol"
     }
-  ]
+  ],
+  "kol_swarm_window_seconds": 900,
+  "kol_swarm_min_wallets": 2,
+  "kol_full_security_report": true
 }
